@@ -1,0 +1,2 @@
+# Semantic_Segmentation_of_dead_trees
+Master Thesis
