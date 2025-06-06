@@ -1,5 +1,8 @@
 """
-U-Net Training Script for Semantic Segmentation
+U-Net Training Script for Semantic Segmentation with Data Augmentation
+
+Installation requirements:
+pip install torch torchvision albumentations opencv-python matplotlib tqdm pillow numpy
 
 Usage:
 1. Edit the configuration variables in the main() function
@@ -18,6 +21,7 @@ data/
 
 The script will automatically:
 - Load PNG images and masks
+- Apply data augmentations during training
 - Split data into train/validation sets
 - Train the U-Net model
 - Save the best model as 'best_unet_model.pth'
@@ -35,9 +39,104 @@ import os
 import glob
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+
+def get_training_augmentation(img_size, augmentation_prob=0.5, rotation_limit=45,
+                              brightness_contrast_limit=0.2, hue_saturation_limit=20):
+    """
+    Create training augmentation pipeline optimized for forestry/aerial imagery
+
+    Augmentations included:
+    - Geometric: Flips, rotations (simulate different viewing angles)
+    - Photometric: Brightness, contrast, hue changes (simulate different lighting/seasons)
+    - Weather: Noise, blur (simulate atmospheric conditions)
+    - Shadow simulation (important for forest canopy analysis)
+    """
+    train_transform = [
+        # Resize to target size
+        A.Resize(img_size, img_size),
+
+        # Geometric augmentations (good for aerial imagery)
+        A.HorizontalFlip(p=augmentation_prob),
+        A.VerticalFlip(p=augmentation_prob),
+        A.RandomRotate90(p=augmentation_prob),
+        A.ShiftScaleRotate(
+            shift_limit=0.0625,  # Small shifts
+            scale_limit=0.1,  # Small scaling
+            rotate_limit=rotation_limit,
+            interpolation=1,
+            border_mode=0,
+            p=augmentation_prob
+        ),
+
+        # Optical/atmospheric augmentations (simulate different lighting/weather)
+        A.OneOf([
+            A.RandomBrightnessContrast(
+                brightness_limit=brightness_contrast_limit,
+                contrast_limit=brightness_contrast_limit,
+                p=1.0
+            ),
+            A.RandomGamma(gamma_limit=(80, 120), p=1.0),
+            A.HueSaturationValue(
+                hue_shift_limit=hue_saturation_limit,
+                sat_shift_limit=hue_saturation_limit,
+                val_shift_limit=hue_saturation_limit,
+                p=1.0
+            ),
+        ], p=augmentation_prob),
+
+        # Weather/atmospheric effects
+        A.OneOf([
+            A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+            A.Blur(blur_limit=3, p=1.0),
+            A.MotionBlur(blur_limit=3, p=1.0),
+        ], p=augmentation_prob * 0.3),  # Lower probability for noise
+
+        # Shadow simulation (important for forestry)
+        A.RandomShadow(
+            shadow_roi=(0, 0.5, 1, 1),  # Lower half more likely to have shadows
+            num_shadows_lower=1,
+            num_shadows_upper=2,
+            shadow_dimension=5,
+            p=augmentation_prob * 0.3
+        ),
+
+        # Normalization (ImageNet stats work well for natural images)
+        A.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+            max_pixel_value=255.0,
+        ),
+
+        # Convert to PyTorch tensor
+        ToTensorV2(),
+    ]
+
+    return A.Compose(train_transform)
+
+
+def get_validation_augmentation(img_size):
+    """
+    Create validation augmentation pipeline (only resize and normalize)
+    """
+    val_transform = [
+        A.Resize(img_size, img_size),
+        A.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+            max_pixel_value=255.0,
+        ),
+        ToTensorV2(),
+    ]
+
+    return A.Compose(val_transform)
+
 
 class DoubleConv(nn.Module):
     """(convolution => [BN] => ReLU) * 2"""
+
     def __init__(self, in_channels, out_channels, mid_channels=None):
         super().__init__()
         if not mid_channels:
@@ -54,8 +153,10 @@ class DoubleConv(nn.Module):
     def forward(self, x):
         return self.double_conv(x)
 
+
 class Down(nn.Module):
     """Downscaling with maxpool then double conv"""
+
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.maxpool_conv = nn.Sequential(
@@ -66,8 +167,10 @@ class Down(nn.Module):
     def forward(self, x):
         return self.maxpool_conv(x)
 
+
 class Up(nn.Module):
     """Upscaling then double conv"""
+
     def __init__(self, in_channels, out_channels, bilinear=True):
         super().__init__()
 
@@ -91,6 +194,7 @@ class Up(nn.Module):
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
+
 class OutConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(OutConv, self).__init__()
@@ -98,6 +202,7 @@ class OutConv(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
 
 class UNet(nn.Module):
     def __init__(self, n_channels, n_classes, bilinear=False):
@@ -131,13 +236,14 @@ class UNet(nn.Module):
         logits = self.outc(x)
         return logits
 
+
 class SegmentationDataset(Dataset):
     def __init__(self, image_dir, mask_dir, transform=None, img_size=(256, 256)):
         """
         Args:
             image_dir (string): Directory with all the images
             mask_dir (string): Directory with all the masks
-            transform (callable, optional): Optional transform to be applied on a sample
+            transform (callable, optional): Albumentations transform to be applied
             img_size (tuple): Target size for images and masks
         """
         self.image_dir = image_dir
@@ -147,10 +253,18 @@ class SegmentationDataset(Dataset):
 
         # Get all image files
         self.image_files = sorted(glob.glob(os.path.join(image_dir, "*.png")))
+        if not self.image_files:
+            # Try jpg if no png files found
+            self.image_files = sorted(glob.glob(os.path.join(image_dir, "*.jpg")))
+
         self.mask_files = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
+        if not self.mask_files:
+            # Try jpg if no png files found
+            self.mask_files = sorted(glob.glob(os.path.join(mask_dir, "*.jpg")))
 
         # Ensure we have matching pairs
-        assert len(self.image_files) == len(self.mask_files), f"Number of images ({len(self.image_files)}) and masks ({len(self.mask_files)}) don't match"
+        assert len(self.image_files) == len(
+            self.mask_files), f"Number of images ({len(self.image_files)}) and masks ({len(self.mask_files)}) don't match"
 
         print(f"Found {len(self.image_files)} image-mask pairs")
 
@@ -166,28 +280,28 @@ class SegmentationDataset(Dataset):
         image = Image.open(image_path).convert('RGB')
         mask = Image.open(mask_path).convert('L')  # Convert to grayscale
 
-        # Resize to target size
-        image = image.resize(self.img_size, Image.BILINEAR)
-        mask = mask.resize(self.img_size, Image.NEAREST)
-
         # Convert to numpy arrays
         image = np.array(image)
         mask = np.array(mask)
 
         # Normalize mask values (assuming binary segmentation: 0 and 255 -> 0 and 1)
-        mask = (mask > 128).astype(np.float32)
+        mask = (mask > 128).astype(np.uint8)  # Keep as uint8 for albumentations
 
-        # Apply transforms if provided
+        # Apply augmentations if provided
         if self.transform:
             transformed = self.transform(image=image, mask=mask)
             image = transformed['image']
             mask = transformed['mask']
+
+            # Convert mask to long tensor for loss calculation
+            mask = mask.long()
         else:
-            # Convert to torch tensors
+            # Fallback: basic preprocessing without augmentation
             image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
             mask = torch.from_numpy(mask).long()
 
         return image, mask
+
 
 def dice_coefficient(pred, target, smooth=1e-6):
     """Calculate Dice coefficient for binary segmentation
@@ -206,6 +320,7 @@ def dice_coefficient(pred, target, smooth=1e-6):
     dice = (2. * intersection + smooth) / (union + smooth)
     return dice.mean()
 
+
 def pixel_accuracy(pred, target):
     """Calculate pixel accuracy"""
     pred = torch.sigmoid(pred)
@@ -213,6 +328,7 @@ def pixel_accuracy(pred, target):
     correct = (pred == target).float()
     accuracy = correct.sum() / correct.numel()
     return accuracy
+
 
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-6):
@@ -231,6 +347,7 @@ class DiceLoss(nn.Module):
 
         return 1 - dice
 
+
 class CombinedLoss(nn.Module):
     def __init__(self, alpha=0.5):
         super(CombinedLoss, self).__init__()
@@ -242,6 +359,7 @@ class CombinedLoss(nn.Module):
         bce_loss = self.bce(pred, target.float())
         dice_loss = self.dice(pred, target)
         return self.alpha * bce_loss + (1 - self.alpha) * dice_loss
+
 
 def train_model(model, train_loader, val_loader, num_epochs, device, learning_rate=1e-4):
     """Training function"""
@@ -260,7 +378,7 @@ def train_model(model, train_loader, val_loader, num_epochs, device, learning_ra
         train_dice = 0.0
         train_acc = 0.0
 
-        train_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]')
+        train_bar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs} [Train]')
         for batch_idx, (images, masks) in enumerate(train_bar):
             images, masks = images.to(device), masks.to(device)
 
@@ -294,7 +412,7 @@ def train_model(model, train_loader, val_loader, num_epochs, device, learning_ra
         val_acc = 0.0
 
         with torch.no_grad():
-            val_bar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]')
+            val_bar = tqdm(val_loader, desc=f'Epoch {epoch + 1}/{num_epochs} [Val]')
             for images, masks in val_bar:
                 images, masks = images.to(device), masks.to(device)
 
@@ -326,7 +444,7 @@ def train_model(model, train_loader, val_loader, num_epochs, device, learning_ra
         train_losses.append(train_loss)
         val_losses.append(val_loss)
 
-        print(f'Epoch {epoch+1}/{num_epochs}:')
+        print(f'Epoch {epoch + 1}/{num_epochs}:')
         print(f'Train Loss: {train_loss:.4f}, Train Dice: {train_dice:.4f}, Train Acc: {train_acc:.4f}')
         print(f'Val Loss: {val_loss:.4f}, Val Dice: {val_dice:.4f}, Val Acc: {val_acc:.4f}')
         print('-' * 60)
@@ -348,10 +466,11 @@ def train_model(model, train_loader, val_loader, num_epochs, device, learning_ra
 
     return train_losses, val_losses
 
+
 def visualize_predictions(model, dataset, device, num_samples=4):
     """Visualize model predictions"""
     model.eval()
-    fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4*num_samples))
+    fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
 
     with torch.no_grad():
         for i in range(num_samples):
@@ -365,7 +484,16 @@ def visualize_predictions(model, dataset, device, num_samples=4):
             pred = torch.sigmoid(pred).squeeze().cpu().numpy()
 
             # Convert tensors to numpy for visualization
-            image_np = image.permute(1, 2, 0).numpy()
+            if image.dim() == 3:  # If image is normalized, denormalize for visualization
+                # Denormalize using ImageNet stats
+                mean = np.array([0.485, 0.456, 0.406])
+                std = np.array([0.229, 0.224, 0.225])
+                image_np = image.permute(1, 2, 0).numpy()
+                image_np = std * image_np + mean
+                image_np = np.clip(image_np, 0, 1)
+            else:
+                image_np = image.permute(1, 2, 0).numpy()
+
             mask_np = mask.numpy()
 
             # Plot
@@ -382,8 +510,75 @@ def visualize_predictions(model, dataset, device, num_samples=4):
             axes[i, 2].axis('off')
 
     plt.tight_layout()
-    plt.savefig('predictions_visualization_simple.png', dpi=150, bbox_inches='tight')
+    plt.savefig('predictions_visualization_augmentation.png', dpi=150, bbox_inches='tight')
     plt.show()
+
+
+def visualize_augmentations(dataset, transform, num_samples=4):
+    """Visualize augmentation effects on sample images"""
+    fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
+
+    for i in range(num_samples):
+        # Get a sample
+        idx = np.random.randint(0, len(dataset))
+
+        # Get original image and mask (without transform)
+        image_path = dataset.image_files[idx]
+        mask_path = dataset.mask_files[idx]
+
+        image = np.array(Image.open(image_path).convert('RGB'))
+        mask = np.array(Image.open(mask_path).convert('L'))
+        mask = (mask > 128).astype(np.uint8)
+
+        # Resize for consistency
+        from albumentations import Resize
+        resize_transform = Resize(256, 256)
+        resized = resize_transform(image=image, mask=mask)
+        image_resized = resized['image']
+        mask_resized = resized['mask']
+
+        # Apply augmentation
+        augmented = transform(image=image_resized, mask=mask_resized)
+        aug_image = augmented['image']
+        aug_mask = augmented['mask']
+
+        # Convert tensor back to numpy for visualization
+        if isinstance(aug_image, torch.Tensor):
+            # Denormalize
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            aug_image_np = aug_image.permute(1, 2, 0).numpy()
+            aug_image_np = std * aug_image_np + mean
+            aug_image_np = np.clip(aug_image_np, 0, 1)
+        else:
+            aug_image_np = aug_image / 255.0
+
+        if isinstance(aug_mask, torch.Tensor):
+            aug_mask_np = aug_mask.numpy()
+        else:
+            aug_mask_np = aug_mask
+
+        # Plot
+        axes[i, 0].imshow(image_resized)
+        axes[i, 0].set_title('Original Image')
+        axes[i, 0].axis('off')
+
+        axes[i, 1].imshow(mask_resized, cmap='gray')
+        axes[i, 1].set_title('Original Mask')
+        axes[i, 1].axis('off')
+
+        axes[i, 2].imshow(aug_image_np)
+        axes[i, 2].set_title('Augmented Image')
+        axes[i, 2].axis('off')
+
+        axes[i, 3].imshow(aug_mask_np, cmap='gray')
+        axes[i, 3].set_title('Augmented Mask')
+        axes[i, 3].axis('off')
+
+    plt.tight_layout()
+    plt.savefig('augmentation_visualization.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
 
 def main():
     # =============================================================================
@@ -392,11 +587,19 @@ def main():
     IMAGE_DIR = "/Users/christian/Downloads/15168163/Training_data/Train"  # Directory containing training images (.png)
     MASK_DIR = "/Users/christian/Downloads/15168163/Training_data/Mask"  # Directory containing training masks (.png)
     EPOCHS = 20  # Number of training epochs
-    BATCH_SIZE = 8  # Batch size for training
+    BATCH_SIZE = 16  # Batch size for training
     LEARNING_RATE = 1e-4  # Learning rate
     IMG_SIZE = 256  # Input image size (will resize to IMG_SIZE x IMG_SIZE)
     VAL_SPLIT = 0.2  # Validation split ratio (0.2 = 20% for validation)
     N_CLASSES = 1  # Number of output classes (1 for binary segmentation)
+
+    # AUGMENTATION SETTINGS
+    USE_AUGMENTATION = True  # Enable/disable data augmentation
+    VISUALIZE_AUGMENTATIONS = True  # Show augmentation examples before training
+    AUGMENTATION_PROB = 0.5  # Probability for most augmentations
+    ROTATION_LIMIT = 45  # Max rotation angle in degrees
+    BRIGHTNESS_CONTRAST_LIMIT = 0.2  # Brightness/contrast variation
+    HUE_SATURATION_LIMIT = 20  # Hue/saturation variation
     # =============================================================================
 
     # Set device and configure DataLoader settings
@@ -409,35 +612,79 @@ def main():
     use_pin_memory = device.type == 'cuda'
     num_workers = 2 if device.type == 'mps' else 4  # Reduce workers for MPS
 
-    # Create datasets
+    # Create augmentation transforms
+    if USE_AUGMENTATION:
+        print("Creating augmentation pipelines...")
+        train_transform = get_training_augmentation(
+            img_size=IMG_SIZE,
+            augmentation_prob=AUGMENTATION_PROB,
+            rotation_limit=ROTATION_LIMIT,
+            brightness_contrast_limit=BRIGHTNESS_CONTRAST_LIMIT,
+            hue_saturation_limit=HUE_SATURATION_LIMIT
+        )
+        val_transform = get_validation_augmentation(img_size=IMG_SIZE)
+        print("✓ Augmentation pipelines created")
+    else:
+        print("Augmentation disabled - using basic preprocessing only")
+        train_transform = None
+        val_transform = None
+
+    # Create full dataset first
     full_dataset = SegmentationDataset(
         image_dir=IMAGE_DIR,
         mask_dir=MASK_DIR,
+        transform=None,  # We'll apply transforms after splitting
         img_size=(IMG_SIZE, IMG_SIZE)
     )
 
-    # Split dataset
-    train_size = int((1 - VAL_SPLIT) * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size]
+    # Split dataset indices
+    dataset_size = len(full_dataset)
+    indices = list(range(dataset_size))
+    split = int(np.floor(VAL_SPLIT * dataset_size))
+
+    np.random.shuffle(indices)
+    train_indices, val_indices = indices[split:], indices[:split]
+
+    # Create separate datasets with different transforms
+    train_dataset = SegmentationDataset(
+        image_dir=IMAGE_DIR,
+        mask_dir=MASK_DIR,
+        transform=train_transform,
+        img_size=(IMG_SIZE, IMG_SIZE)
     )
 
-    print(f'Training samples: {len(train_dataset)}')
-    print(f'Validation samples: {len(val_dataset)}')
+    val_dataset = SegmentationDataset(
+        image_dir=IMAGE_DIR,
+        mask_dir=MASK_DIR,
+        transform=val_transform,
+        img_size=(IMG_SIZE, IMG_SIZE)
+    )
 
-    # Create data loaders
+    # Create subset samplers
+    from torch.utils.data import SubsetRandomSampler
+    train_sampler = SubsetRandomSampler(train_indices)
+    val_sampler = SubsetRandomSampler(val_indices)
+
+    print(f'Training samples: {len(train_indices)}')
+    print(f'Validation samples: {len(val_indices)}')
+
+    # Visualize augmentations if requested
+    if USE_AUGMENTATION and VISUALIZE_AUGMENTATIONS:
+        print("Generating augmentation examples...")
+        visualize_augmentations(train_dataset, train_transform, num_samples=3)
+
+    # Create data loaders with samplers
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=use_pin_memory
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=use_pin_memory
     )
@@ -460,16 +707,24 @@ def main():
     plt.ylabel('Loss')
     plt.legend()
     plt.title('Training History')
-    plt.savefig('training_history_simple.png', dpi=150, bbox_inches='tight')
+    plt.savefig('training_history_augmentations.png', dpi=150, bbox_inches='tight')
     plt.show()
 
     # Visualize some predictions
-    visualize_predictions(model, full_dataset, device)
+    visualize_predictions(model, train_dataset, device)
 
     print('Training completed! Best model saved as best_unet_model.pth')
     print('To use this model for inference, load it with:')
     print('checkpoint = torch.load("best_unet_model.pth")')
     print('model.load_state_dict(checkpoint["model_state_dict"])')
+
+    if USE_AUGMENTATION:
+        print(f'\nAugmentation settings used:')
+        print(f'- Augmentation probability: {AUGMENTATION_PROB}')
+        print(f'- Rotation limit: {ROTATION_LIMIT}°')
+        print(f'- Brightness/contrast limit: {BRIGHTNESS_CONTRAST_LIMIT}')
+        print(f'- Hue/saturation limit: {HUE_SATURATION_LIMIT}')
+
 
 if __name__ == '__main__':
     main()

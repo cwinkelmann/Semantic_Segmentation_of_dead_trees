@@ -1,7 +1,7 @@
 # Semantic Segmentation of Dead Trees
 
 
-Reproduction of master thesis using pytorch
+Reproduction of master thesis using pytorch using claude.ai
 
 Install requirements.txt first
 ```shell
@@ -25,11 +25,14 @@ Modify this to match your folders and setup
 ```
 
 
-add the training_history.png
-
-![![Training History](training_history.png)](training_history.png)
+### Training History withou Augmentations 
+![![Training History](training_history_simple.png)](images/training_history_simple.png)
 
 predictions._visualization
-![![Predictions Visualization](predictions_visualization.png)](predictions_visualization.png)
+![![Predictions Visualization](predictions_visualization_simple.png)](images/predictions_visualization_simple.png)
 
 
+With Augmentations
+![![Training History](training_history_augmentations.png)](images/training_history_augmentations.png)
+
+![![Training History](predictions_visualization_augmentation.png)](images/predictions_visualization_augmentation.png)
